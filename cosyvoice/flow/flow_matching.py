@@ -128,27 +128,45 @@ class ConditionalCFM(BASECFM):
             return self.estimator(x, mask, mu, t, spks, cond, streaming=streaming)
         else:
             [estimator, stream], trt_engine = self.estimator.acquire_estimator()
-            # NOTE need to synchronize when switching stream
-            torch.cuda.current_stream().synchronize()
-            with stream:
-                estimator.set_input_shape('x', (2, 80, x.size(2)))
-                estimator.set_input_shape('mask', (2, 1, x.size(2)))
-                estimator.set_input_shape('mu', (2, 80, x.size(2)))
-                estimator.set_input_shape('t', (2,))
-                estimator.set_input_shape('spks', (2, 80))
-                estimator.set_input_shape('cond', (2, 80, x.size(2)))
-                data_ptrs = [x.contiguous().data_ptr(),
-                             mask.contiguous().data_ptr(),
-                             mu.contiguous().data_ptr(),
-                             t.contiguous().data_ptr(),
-                             spks.contiguous().data_ptr(),
-                             cond.contiguous().data_ptr(),
-                             x.data_ptr()]
-                for i, j in enumerate(data_ptrs):
-                    estimator.set_tensor_address(trt_engine.get_tensor_name(i), j)
-                # run trt engine
-                assert estimator.execute_async_v3(torch.cuda.current_stream().cuda_stream) is True
+            if hasattr(estimator, 'execute_async_v3'):
+                # NOTE need to synchronize when switching stream
                 torch.cuda.current_stream().synchronize()
+                with stream:
+                    estimator.set_input_shape('x', (2, 80, x.size(2)))
+                    estimator.set_input_shape('mask', (2, 1, x.size(2)))
+                    estimator.set_input_shape('mu', (2, 80, x.size(2)))
+                    estimator.set_input_shape('t', (2,))
+                    estimator.set_input_shape('spks', (2, 80))
+                    estimator.set_input_shape('cond', (2, 80, x.size(2)))
+                    data_ptrs = [x.contiguous().data_ptr(),
+                                 mask.contiguous().data_ptr(),
+                                 mu.contiguous().data_ptr(),
+                                 t.contiguous().data_ptr(),
+                                 spks.contiguous().data_ptr(),
+                                 cond.contiguous().data_ptr(),
+                                 x.data_ptr()]
+                    for i, j in enumerate(data_ptrs):
+                        estimator.set_tensor_address(trt_engine.get_tensor_name(i), j)
+                    # run trt engine
+                    assert estimator.execute_async_v3(torch.cuda.current_stream().cuda_stream) is True
+                    torch.cuda.current_stream().synchronize()
+            else:
+                input_names = self.estimator.input_names
+                output_names = self.estimator.output_names
+                # ONNX convert torch.Tensor to numpy, convert dtype to float32
+                inputs = {
+                    input_names[0]: x.cpu().numpy(),
+                    input_names[1]: mask.cpu().numpy(),
+                    input_names[2]: mu.cpu().numpy(),
+                    input_names[3]: t.cpu().numpy(),
+                    input_names[4]: spks.cpu().numpy(),
+                    input_names[5]: cond.cpu().numpy()
+                }
+
+                outputs = estimator.run(output_names, inputs)
+                result = torch.from_numpy(outputs[0]).to(x.device)
+                x.copy_(result)
+
             self.estimator.release_estimator(estimator, stream)
             return x
 

@@ -32,6 +32,119 @@ from cosyvoice.transformer.convolution import CausalConv1d, CausalConv1dDownSamp
 from cosyvoice.transformer.activation import Snake
 from cosyvoice.utils.common import get_padding
 from cosyvoice.utils.common import init_weights
+import types
+
+
+class STFT_Conv(nn.Module):
+    def __init__(self, n_fft, hop_length, window):
+        super().__init__()
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.pad_amount = n_fft // 2
+
+        dim = n_fft // 2 + 1
+        n = torch.arange(n_fft)
+        k = torch.arange(dim).unsqueeze(1)
+        args = 2 * np.pi * n * k / n_fft
+
+        # FFT basis: sum(x * e^{-j2pi nk/N})
+        # Real: sum(x * cos)
+        # Imag: sum(x * -sin)
+        cos_basis = torch.cos(args) * window
+        sin_basis = -torch.sin(args) * window
+
+        self.register_buffer('weight_real', cos_basis.unsqueeze(1).float())
+        self.register_buffer('weight_imag', sin_basis.unsqueeze(1).float())
+
+    def forward(self, x):
+        # x: [B, T]
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+
+        # center=True padding
+        x = F.pad(x, (self.pad_amount, self.pad_amount), mode='reflect')
+
+        real = F.conv1d(x, self.weight_real, stride=self.hop_length)
+        imag = F.conv1d(x, self.weight_imag, stride=self.hop_length)
+        return real, imag
+
+class ISTFT_Conv(nn.Module):
+    def __init__(self, n_fft, hop_length, window):
+        super().__init__()
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+
+        dim = n_fft // 2 + 1
+        n = torch.arange(n_fft).unsqueeze(1)
+        k = torch.arange(dim)
+        args = 2 * np.pi * n * k / n_fft
+
+        # IFFT basis: 1/N * sum(X * e^{j2pi nk/N})
+        # But here we just compute the sum, scaling is handled at the end.
+
+        # Real part of e^{j...} is cos, Imag is sin.
+        # (a+jb)(cos+jsin) = (acos - bsin) + j(asin + bcos)
+        # We process Real and Imag parts of spec separately.
+
+        # Window is applied AFTER IFFT in standard torch.istft
+        # Weights: Window[n] * Basis[n, k]
+
+        cos_basis = torch.cos(args) * window.unsqueeze(1)
+        sin_basis = torch.sin(args) * window.unsqueeze(1)
+
+        # For real part of signal: acos - bsin
+        # We need weights that take Real_spec (a) and Imag_spec (b) and produce signal
+        # ConvTranspose1d(C_in, C_out...)
+        # We have C_in = dim (freqs). C_out = 1.
+
+        self.register_buffer('weight_cons', cos_basis.transpose(0, 1).unsqueeze(1).float()) # [dim, 1, n_fft]
+        self.register_buffer('weight_sin', sin_basis.transpose(0, 1).unsqueeze(1).float())
+
+        # NOLA constant for Hann(16), hop=4 is 1.5.
+        # IFFT scaling is 1/16.
+        # Total divisor = 1.5 * 16 = 24.0.
+        self.register_buffer('divisor', torch.tensor(24.0))
+
+    def forward(self, magnitude, phase):
+        # magnitude, phase: [B, F, T]
+        real_spec = magnitude * torch.cos(phase)
+        imag_spec = magnitude * torch.sin(phase)
+
+        # IFFT Real part reconstruction:
+        # Signal = Sum_k ( Real[k]*Cos[nk] - Imag[k]*Sin[nk] )
+
+        y1 = F.conv_transpose1d(real_spec, self.weight_cons, stride=self.hop_length)
+        y2 = F.conv_transpose1d(imag_spec, self.weight_sin, stride=self.hop_length)
+
+        y = y1 - y2
+
+        # Remove center padding (n_fft // 2)
+        # torch.istft(center=True) removes the padding it added implicitly?
+        # No, center=True in stft/istft means the timestamps are centered.
+        # The output length is normally N * Hop.
+        # We just need to handle valid region.
+        # But since we are exporting the generator which usually crops output or matches input length...
+        # Let's check generator code:
+        # x = torch._istft(...)
+        # x = torch.clamp(x, ...)
+        # The generator does not crop explicitly inside decode?
+        # Ah, "x = x[:, :-int(...)]" in finalize=False.
+
+        # Standard istft(center=True) returns length L.
+        # ConvTranspose1d returns length (T-1)*stride + kernel_size.
+        # (T)*Hop + (N_FFT - Hop).
+        # We need to trim the n_fft//2 padding from both sides to match center=True.
+
+        pad = self.n_fft // 2
+        y = y[:, :, pad:-pad]
+
+        # Squeeze the channel dimension if necessary [B, 1, T] -> [B, T]
+        # But wait, generator output expects [B, 1, T] or [B, T]?
+        # Original torch.istft returns [B, T].
+        # ConvTranpose1d returns [B, C_out, T]. Here C_out=1.
+        # So we have [B, 1, T].
+
+        return (y / self.divisor).squeeze(1)
 
 
 """hifigan based generator implementation.
@@ -374,6 +487,8 @@ class SourceModuleHnNSF(torch.nn.Module):
             noise = torch.randn_like(uv) * self.sine_amp / 3
         return sine_merge, noise, uv
 
+    def remove_weight_norm(self):
+        pass
 
 class HiFTGenerator(nn.Module):
     """
@@ -689,6 +804,7 @@ class CausalHiFTGenerator(HiFTGenerator):
             # fusion
             si = self.source_downs[i](s_stft)
             si = self.source_resblocks[i](si)
+
             x = x + si
 
             xs = None
@@ -719,12 +835,102 @@ class CausalHiFTGenerator(HiFTGenerator):
         s = self.f0_upsamp(f0[:, None]).transpose(1, 2)  # bs,n,t
         s, _, _ = self.m_source(s)
         s = s.transpose(1, 2)
+        if hasattr(self, 'stream_model') and hasattr(self, 'final_model'):
+            if finalize is True:
+                ort_inputs = {'speech_feat': speech_feat.cpu().numpy(), 'cache_source': s.cpu().numpy()}
+                ort_outputs = self.final_model.output_names
+                [estimator, stream], _ = self.final_model.acquire_estimator()
+                outputs = estimator.run(ort_outputs, ort_inputs)
+                self.final_model.release_estimator(estimator, stream)
+            else:
+                ort_inputs = {'speech_feat': speech_feat[:, :, :-self.f0_predictor.condnet[0].causal_padding].cpu().numpy(), 'cache_source': s.cpu().numpy()}
+                ort_outputs = self.stream_model.output_names
+                [estimator, stream], _ = self.stream_model.acquire_estimator()
+                outputs = estimator.run(ort_outputs, ort_inputs)
+                self.stream_model.release_estimator(estimator, stream)
+            generated_speech = torch.from_numpy(outputs[0]).to(speech_feat.device)
+            return generated_speech, s
+
         if finalize is True:
             generated_speech = self.decode(x=speech_feat, s=s, finalize=finalize)
         else:
             generated_speech = self.decode(x=speech_feat[:, :, :-self.f0_predictor.condnet[0].causal_padding], s=s, finalize=finalize)
         return generated_speech, s
 
+    def export_onnx(self, onnx_model_path: str, dtype: torch.dtype = torch.float32, device: torch.device = torch.device('cuda:0'), finalize: bool = True) -> None:
+        """ Export the generator to ONNX format
+
+        Args:
+            onnx_model_path (str): Path to save the ONNX model.
+            device (torch.device): Device to run the export on. Default to cpu to avoid potential segfaults with STFT on cuda.
+            finalize (bool): Whether to export finalize=True (full inference) or False (streaming). Default True.
+        """
+        self = self.to(device)
+        self.eval()
+        try:
+            self.remove_weight_norm()
+        except Exception:
+            pass
+
+        # --- Patch STFT/ISTFT with Conv implementations to avoid ONNX export crash / custom op issues ---
+        print("Patching STFT/ISTFT with compatible Conv implementations...")
+        stft_module = STFT_Conv(
+            self.istft_params["n_fft"],
+            self.istft_params["hop_len"],
+            self.stft_window.to(device)
+        ).to(device)
+
+        istft_module = ISTFT_Conv(
+            self.istft_params["n_fft"],
+            self.istft_params["hop_len"],
+            self.stft_window.to(device)
+        ).to(device)
+
+        def patched_stft(self_gen, x):
+            return stft_module(x)
+
+        def patched_istft(self_gen, magnitude, phase):
+            return istft_module(magnitude, phase)
+
+        # Bind methods to the instance
+        self._stft = types.MethodType(patched_stft, self)
+        self._istft = types.MethodType(patched_istft, self)
+        # -----------------------------------------------------------------------------------------------
+
+        # Create a wrapper that fixes the finalize parameter and implements forward logic
+        class ONNXWrapper(torch.nn.Module):
+            def __init__(self, model, finalize_value):
+                super().__init__()
+                self.model = model
+                self.finalize_value = finalize_value
+
+            def forward(self, speech_feat, s):
+                s = s.to(speech_feat.dtype)
+                x = self.model.decode(x=speech_feat, s=s, finalize=self.finalize_value)
+                return x
+
+        wrapper = ONNXWrapper(self, finalize)
+        speech_feat = torch.randn(1, 80, 300, device=device, dtype=torch.float32)
+        s = torch.randn(1, 1, speech_feat.shape[2] * 480, device=device, dtype=torch.float32)
+
+        torch.onnx.export(
+            wrapper,
+            (speech_feat, s),
+            onnx_model_path,
+            export_params=True,
+            opset_version=10, # User specified 10 to avoid core dump
+            do_constant_folding=True,
+            verbose=False,
+            #operator_export_type=torch.onnx.OperatorExportTypes.ONNX_ATEN_FALLBACK,
+            input_names=['speech_feat', 'cache_source'],
+            output_names=['waveform'],
+            dynamic_axes={
+                'speech_feat': {0: 'batch', 2: 'time'},
+                'cache_source': {0: 'batch', 2: 'time'},
+                'waveform': {1: 'time'},
+            },
+        )
+        print("Export complete.")
 
 if __name__ == '__main__':
     torch.backends.cudnn.deterministic = True

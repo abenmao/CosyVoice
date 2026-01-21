@@ -215,15 +215,25 @@ class CosyVoice3(CosyVoice2):
         self.model.load('{}/llm.pt'.format(model_dir),
                         '{}/flow.pt'.format(model_dir),
                         '{}/hift.pt'.format(model_dir))
+
+        if os.path.exists('{}/hift.generator.fp32.final.onnx'.format(model_dir)) is False or \
+           os.path.exists('{}/hift.generator.fp32.stream.onnx'.format(model_dir)) is False:
+            self.model.hift.export_onnx('{}/hift.generator.fp32.final.onnx'.format(model_dir))
+            self.model.hift.export_onnx('{}/hift.generator.fp32.stream.onnx'.format(model_dir), finalize=False)
         if load_vllm:
             self.model.load_vllm('{}/vllm'.format(model_dir))
         if load_trt:
             if self.fp16 is True:
                 logging.warning('DiT tensorRT fp16 engine have some performance issue, use at caution!')
-            self.model.load_trt('{}/flow.decoder.estimator.{}.mygpu.plan'.format(model_dir, 'fp16' if self.fp16 is True else 'fp32'),
-                                '{}/flow.decoder.estimator.fp32.onnx'.format(model_dir),
-                                trt_concurrent,
-                                self.fp16)
+            if self.fp16:
+                self.model.load_trt('{}/flow.decoder.estimator.{}.mygpu.plan'.format(model_dir, 'fp16' if self.fp16 is True else 'fp32'),
+                                    '{}/flow.decoder.estimator.fp32.onnx'.format(model_dir),
+                                    trt_concurrent,
+                                    self.fp16)
+            else:
+                self.model.load_onnxruntime('{}/flow.decoder.estimator.fp32.onnx'.format(model_dir),
+                                            '{}/hift.generator.fp32.final.onnx'.format(model_dir),
+                                            '{}/hift.generator.fp32.stream.onnx'.format(model_dir))
         del configs
 
 
