@@ -91,6 +91,40 @@ class CosyVoiceModel:
         assert estimator_engine is not None, 'failed to load trt {}'.format(flow_decoder_estimator_model)
         self.flow.decoder.estimator = TrtContextWrapper(estimator_engine, trt_concurrent=trt_concurrent, device=self.device)
 
+    def load_onnxruntime(self, flow_decoder_onnx_model, hift_onnx_final_model, hift_onnx_stream_model, providers=None):
+        try:
+            import onnxruntime as ort
+        except ImportError:
+            raise ImportError('ONNX Runtime is required. Install with: pip install onnxruntime or onnxruntime-gpu or onnxruntime-openvino')
+
+        if not os.path.exists(flow_decoder_onnx_model):
+            raise FileNotFoundError(f'ONNX model not found: {flow_decoder_onnx_model}')
+
+        from cosyvoice.utils.common import ONNXRuntimeWrapper
+
+        if providers is None:
+            available_providers = ort.get_available_providers()
+            if 'CUDAExecutionProvider' in available_providers:
+                providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+            else:
+                providers = ['CPUExecutionProvider']
+
+        option = ort.SessionOptions()
+        option.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        #option.intra_op_num_threads = 4
+        #option.inter_op_num_threads = 4
+        session = ort.InferenceSession(flow_decoder_onnx_model, sess_options=option, providers=providers)
+        # remove the original PyTorch module to avoid type check error
+        del self.flow.decoder.estimator
+        self.flow.decoder.estimator = ONNXRuntimeWrapper(session, device=self.device)
+
+        if os.path.exists(hift_onnx_final_model) and os.path.exists(hift_onnx_stream_model):
+            session = ort.InferenceSession(hift_onnx_final_model, sess_options=option, providers=providers)
+            self.hift.final_model = ONNXRuntimeWrapper(session, device=self.device)
+
+            session = ort.InferenceSession(hift_onnx_stream_model, sess_options=option, providers=providers)
+            self.hift.stream_model = ONNXRuntimeWrapper(session, device=self.device)
+
     def get_trt_kwargs(self):
         min_shape = [(2, 80, 4), (2, 1, 4), (2, 80, 4), (2, 80, 4)]
         opt_shape = [(2, 80, 500), (2, 1, 500), (2, 80, 500), (2, 80, 500)]
@@ -279,8 +313,9 @@ class CosyVoice2Model(CosyVoiceModel):
         from vllm import EngineArgs, LLMEngine
         engine_args = EngineArgs(model=model_dir,
                                  skip_tokenizer_init=True,
-                                 enable_prompt_embeds=True,
-                                 gpu_memory_utilization=0.2)
+                                 enable_prompt_embeds=True, # Fall back to V0
+                                 gpu_memory_utilization=0.2,
+                                 compilation_config={"full_cuda_graph": False})
         self.llm.vllm = LLMEngine.from_engine_args(engine_args)
         self.llm.lock = threading.Lock()
         del self.llm.llm.model.model.layers

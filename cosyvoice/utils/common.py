@@ -211,3 +211,22 @@ class TrtContextWrapper:
 
     def release_estimator(self, context, stream):
         self.trt_context_pool.put([context, stream])
+
+
+class ONNXRuntimeWrapper:
+    def __init__(self, session, onnx_concurrent=1, device='cuda:0'):
+        self.session_pool = queue.Queue(maxsize=onnx_concurrent)
+        self.onnx_session = session
+        self.device = device
+        self.input_names = [inp.name for inp in session.get_inputs()]
+        self.output_names = [out.name for out in session.get_outputs()]
+
+        for _ in range(onnx_concurrent):
+            self.session_pool.put([session, None])
+        assert self.session_pool.empty() is False, 'no available ONNX session'
+
+    def acquire_estimator(self):
+        return self.session_pool.get(), self.onnx_session
+
+    def release_estimator(self, session, _):
+        self.session_pool.put([session, _])
