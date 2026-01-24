@@ -220,6 +220,11 @@ def main() -> None:
             "triton.cudagraphs": True,
             "epilogue_fusion": True,
             "max_autotune": True,
+            # Intel GPU
+            "xpu.omp_num_threads": 4,  # Arc B60: 20 Xe cores，4 threads best
+            "xpu.task_group_parallelism": 4,
+            #"triton.cudagraphs": True,
+            "triton.syclgraphs": True,
         }
     #import pdb
     #pdb.set_trace()

@@ -214,7 +214,7 @@ class TrtContextWrapper:
 
 
 class ONNXRuntimeWrapper:
-    def __init__(self, session, onnx_concurrent=1, device='cuda:0'):
+    def __init__(self, session, onnx_concurrent=1, device='xpu'):
         self.session_pool = queue.Queue(maxsize=onnx_concurrent)
         self.onnx_session = session
         self.device = device

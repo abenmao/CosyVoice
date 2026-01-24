@@ -857,7 +857,7 @@ class CausalHiFTGenerator(HiFTGenerator):
             generated_speech = self.decode(x=speech_feat[:, :, :-self.f0_predictor.condnet[0].causal_padding], s=s, finalize=finalize)
         return generated_speech, s
 
-    def export_onnx(self, onnx_model_path: str, dtype: torch.dtype = torch.float32, device: torch.device = torch.device('cuda:0'), finalize: bool = True) -> None:
+    def export_onnx(self, onnx_model_path: str, dtype: torch.dtype = torch.float32, device: torch.device = torch.device('xpu'), finalize: bool = True) -> None:
         """ Export the generator to ONNX format
 
         Args:
