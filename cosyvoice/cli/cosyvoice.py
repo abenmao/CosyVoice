@@ -218,8 +218,20 @@ class CosyVoice3(CosyVoice2):
 
         if os.path.exists('{}/hift.generator.fp32.final.onnx'.format(model_dir)) is False or \
            os.path.exists('{}/hift.generator.fp32.stream.onnx'.format(model_dir)) is False:
-            self.model.hift.export_onnx('{}/hift.generator.fp32.final.onnx'.format(model_dir))
-            self.model.hift.export_onnx('{}/hift.generator.fp32.stream.onnx'.format(model_dir), finalize=False)
+            # Run export in a separate process to avoid I-PEX/ONNX conflicts leading to coredumps
+            import subprocess
+            import sys
+            export_script = os.path.join(os.getcwd(), 'tools/export_hift.py')
+            if not os.path.exists(export_script):
+                 # Assuming working from source for now as per workspace structure
+                 logging.warning(f"Export script not found at {export_script}, skipping/trying direct export which might crash.")
+                 self.model.hift.export_onnx('{}/hift.generator.fp32.final.onnx'.format(model_dir))
+                 self.model.hift.export_onnx('{}/hift.generator.fp32.stream.onnx'.format(model_dir), finalize=False)
+            else:
+                 cmd = [sys.executable, export_script, '--model_dir', model_dir]
+                 logging.info(f"Running safe ONNX export via subprocess: {' '.join(cmd)}")
+                 subprocess.check_call(cmd)
+
         if load_vllm:
             self.model.load_vllm('{}/vllm'.format(model_dir))
         if load_trt:

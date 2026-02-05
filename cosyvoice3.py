@@ -30,6 +30,7 @@ except ImportError as ex:
 
 try:
     import torchaudio
+    import soundfile as sf
 except ImportError as ex:
     raise ImportError(
         "torchaudio is required for saving the generated waveform."
@@ -45,7 +46,9 @@ def save_audio(output_path: Path, waveform: torch.Tensor, sample_rate: int) -> N
 
     suffix = output_path.suffix.lower()
     print("Saving audio to ", output_path)
-    torchaudio.save(str(output_path), channels_first, sample_rate)
+    #torchaudio.save(str(output_path), channels_first, sample_rate)
+    data = channels_first.t().numpy()
+    sf.write(str(output_path), data, sample_rate)
     return
 
 
@@ -117,11 +120,11 @@ def run_inference_zero_shot(
 
     print(f"[Metrics] Total response time: {total_response_time:.4f} seconds")
     if stream:
-        print(f"[Metrics] First byte latency: {first_byte_latency:.4f} seconds")
-        print(f"[Metrics] Token throughput: {token_throughput:.2f} token/s")
+        print(f"[Metrics] First byte latency: {first_byte_latency:.4f} seconds" if first_byte_latency is not None else "[Metrics] First byte latency: N/A")
+        print(f"[Metrics] Token throughput: {token_throughput:.2f} token/s" if token_throughput is not None else "[Metrics] Token throughput: N/A")
         print(f"[Metrics] inter-token latencies: {inter_token_latencies}")
-        print(f"[Metrics] Average inter-token latency: {avg_inter_token_latency:.4f} seconds")
-        print(f"[Metrics] Last token latency: {last_token_latency:.4f} seconds")
+        print(f"[Metrics] Average inter-token latency: {avg_inter_token_latency:.4f} seconds" if avg_inter_token_latency is not None else "[Metrics] Average inter-token latency: N/A")
+        print(f"[Metrics] Last token latency: {last_token_latency:.4f} seconds" if last_token_latency is not None else "[Metrics] Last token latency: N/A")
     return waveform
 
 
@@ -197,16 +200,19 @@ def main() -> None:
 
     # Load model once
     print(f"Loading model from {args.model_dir}...")
-    model = AutoModel(model_dir=str(args.model_dir), load_vllm=True, load_trt=True, fp16=False)
+    # default: fp16 True,trt false; ONNX: fp16 false, trt true
+    fp16 = True
+    model = AutoModel(model_dir=str(args.model_dir), load_vllm=True, load_trt=False, fp16=fp16)
     model.model.flow.eval()
     model.model.llm.eval()
-    model.model.llm.eval()
+    model.model.hift.eval()
     try:
         import intel_extension_for_pytorch as ipex  # noqa: F401
         backend = "ipex"
+        dtype = torch.float16 if fp16 else torch.float
         #torch.xpu.memory.set_pool_size(device='xpu:0', size=16**30)  # 预分配 1GB
-        model.model.flow = ipex.optimize(model.model.flow, dtype=torch.bfloat16, graph_mode=True, auto_kernel_selection=True, weights_prepack=True, level="O1")
-        model.model.llm = ipex.optimize(model.model.llm, dtype=torch.bfloat16, graph_mode=True, auto_kernel_selection=True, weights_prepack=True, level="O1")
+        model.model.flow = ipex.optimize(model.model.flow, dtype=dtype, graph_mode=True, auto_kernel_selection=True, weights_prepack=True, level="O1")
+        model.model.llm = ipex.optimize(model.model.llm, dtype=dtype, graph_mode=True, auto_kernel_selection=True, weights_prepack=True, level="O1")
         model.model.hift = ipex.optimize(model.model.hift, graph_mode=True, auto_kernel_selection=True, weights_prepack=True, level="O1")
     except ImportError:
         backend = "inductor"

@@ -18,6 +18,102 @@ from typing import Dict, Optional, List
 import numpy as np
 from scipy.signal import get_window
 import torch
+from torch.onnx import register_custom_op_symbolic
+import torch.onnx.symbolic_helper as sym_help
+
+# -----------------------------------------------------------------------------
+# ONNX Export Symbolics (Custom Registration)
+# -----------------------------------------------------------------------------
+
+def view_as_complex_static(g, input):
+    # Map to Identity (ONNX uses float[..., 2] for complex)
+    return g.op("Identity", input)
+
+def view_as_real_static(g, input):
+    # Map to Identity (ONNX uses float[..., 2] for complex)
+    return g.op("Identity", input)
+
+def fft_rfft_symbolic(g, input, n=None, dim=None, norm=None):
+    # Map aten::fft_rfft to ONNX DFT(inverse=0, onesided=1)
+    # Result is float[..., 2] in ONNX
+    if dim is None or sym_help._is_none(dim):
+        dim_val = -1
+    else:
+        dim_val = sym_help._get_const(dim, 'i', 'dim')
+
+    inputs = [input]
+    if n is not None and not sym_help._is_none(n):
+        # Ensure n is 1D tensor if it's scalar
+        inputs.append(n)
+
+    return g.op("DFT", *inputs, axis_i=dim_val, inverse_i=0, onesided_i=1)
+
+def fft_ifft_symbolic(g, input, n=None, dim=None, norm=None):
+    # Map aten::fft_ifft to ONNX DFT(inverse=1, onesided=0)
+    axis = -1
+    if dim is not None and not sym_help._is_none(dim):
+        dim_val = sym_help._maybe_get_const(dim, 'i')
+        if dim_val is not None:
+            axis = dim_val
+    return g.op("DFT", input, axis_i=axis, inverse_i=1, onesided_i=0)
+
+def fft_irfft_symbolic(g, input, n=None, dim=None, norm=None):
+    # Map aten::fft_irfft to ONNX DFT(inverse=1, onesided=1)
+    axis = -1
+    if dim is not None and not sym_help._is_none(dim):
+        dim_val = sym_help._maybe_get_const(dim, 'i')
+        if dim_val is not None:
+            axis = dim_val
+
+    inputs = [input]
+    # n is optional length of output signal. DFT op doesn't take it directly as input usually?
+    # DFT op doesn't support 'n' (signal length) for resizing behavior directly in all opsets,
+    # but for irfft with onesided=1, it implies standard reconstruction.
+    # We ignore n (assuming it matches) or if it's needed for padding/trimming, that's complex.
+    # Usually irfft result length is derived from input or n.
+    # ONNX DFT doesn't seem to take output length.
+
+    return g.op("DFT", *inputs, axis_i=axis, inverse_i=1, onesided_i=1)
+
+def real_symbolic(g, input):
+    # Map aten::real. Input is [..., 2] (complex). Output is [..., ] (real part).
+    # Slice index 0 on last axis
+    sliced = g.op("Slice", input,
+                  g.op("Constant", value_t=torch.tensor([0], dtype=torch.int64)),
+                  g.op("Constant", value_t=torch.tensor([1], dtype=torch.int64)),
+                  g.op("Constant", value_t=torch.tensor([-1], dtype=torch.int64)))
+    return g.op("Squeeze", sliced, g.op("Constant", value_t=torch.tensor([-1], dtype=torch.int64)))
+
+def imag_symbolic(g, input):
+    # Map aten::imag. Input is [..., 2] (complex). Output is [..., ] (imag part).
+    # Slice index 1 on last axis
+    sliced = g.op("Slice", input,
+                  g.op("Constant", value_t=torch.tensor([1], dtype=torch.int64)),
+                  g.op("Constant", value_t=torch.tensor([2], dtype=torch.int64)),
+                  g.op("Constant", value_t=torch.tensor([-1], dtype=torch.int64)))
+    return g.op("Squeeze", sliced, g.op("Constant", value_t=torch.tensor([-1], dtype=torch.int64)))
+
+def conj_symbolic(g, input):
+    # Map aten::conj. Input is [..., 2]. Output is [..., 2] with imag part constant-multiplied by -1.
+    # Multiply by [1, -1]
+    const_val = torch.tensor([1, -1], dtype=torch.float32)
+    const = g.op("Constant", value_t=const_val)
+    return g.op("Mul", input, const)
+
+
+# Register all symbolics in one place
+try:
+    register_custom_op_symbolic("aten::view_as_complex", view_as_complex_static, 17)
+    register_custom_op_symbolic("aten::view_as_real", view_as_real_static, 17)
+    register_custom_op_symbolic("aten::fft_rfft", fft_rfft_symbolic, 17)
+    register_custom_op_symbolic("aten::fft_ifft", fft_ifft_symbolic, 17)
+    register_custom_op_symbolic("aten::fft_irfft", fft_irfft_symbolic, 17)
+    register_custom_op_symbolic("aten::real", real_symbolic, 17)
+    register_custom_op_symbolic("aten::imag", imag_symbolic, 17)
+    register_custom_op_symbolic("aten::_conj", conj_symbolic, 17)
+except Exception as e:
+    print(f"Failed to register custom symbolic: {e}")
+
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import Conv1d
@@ -33,118 +129,6 @@ from cosyvoice.transformer.activation import Snake
 from cosyvoice.utils.common import get_padding
 from cosyvoice.utils.common import init_weights
 import types
-
-
-class STFT_Conv(nn.Module):
-    def __init__(self, n_fft, hop_length, window):
-        super().__init__()
-        self.n_fft = n_fft
-        self.hop_length = hop_length
-        self.pad_amount = n_fft // 2
-
-        dim = n_fft // 2 + 1
-        n = torch.arange(n_fft)
-        k = torch.arange(dim).unsqueeze(1)
-        args = 2 * np.pi * n * k / n_fft
-
-        # FFT basis: sum(x * e^{-j2pi nk/N})
-        # Real: sum(x * cos)
-        # Imag: sum(x * -sin)
-        cos_basis = torch.cos(args) * window
-        sin_basis = -torch.sin(args) * window
-
-        self.register_buffer('weight_real', cos_basis.unsqueeze(1).float())
-        self.register_buffer('weight_imag', sin_basis.unsqueeze(1).float())
-
-    def forward(self, x):
-        # x: [B, T]
-        if x.dim() == 2:
-            x = x.unsqueeze(1)
-
-        # center=True padding
-        x = F.pad(x, (self.pad_amount, self.pad_amount), mode='reflect')
-
-        real = F.conv1d(x, self.weight_real, stride=self.hop_length)
-        imag = F.conv1d(x, self.weight_imag, stride=self.hop_length)
-        return real, imag
-
-class ISTFT_Conv(nn.Module):
-    def __init__(self, n_fft, hop_length, window):
-        super().__init__()
-        self.n_fft = n_fft
-        self.hop_length = hop_length
-
-        dim = n_fft // 2 + 1
-        n = torch.arange(n_fft).unsqueeze(1)
-        k = torch.arange(dim)
-        args = 2 * np.pi * n * k / n_fft
-
-        # IFFT basis: 1/N * sum(X * e^{j2pi nk/N})
-        # But here we just compute the sum, scaling is handled at the end.
-
-        # Real part of e^{j...} is cos, Imag is sin.
-        # (a+jb)(cos+jsin) = (acos - bsin) + j(asin + bcos)
-        # We process Real and Imag parts of spec separately.
-
-        # Window is applied AFTER IFFT in standard torch.istft
-        # Weights: Window[n] * Basis[n, k]
-
-        cos_basis = torch.cos(args) * window.unsqueeze(1)
-        sin_basis = torch.sin(args) * window.unsqueeze(1)
-
-        # For real part of signal: acos - bsin
-        # We need weights that take Real_spec (a) and Imag_spec (b) and produce signal
-        # ConvTranspose1d(C_in, C_out...)
-        # We have C_in = dim (freqs). C_out = 1.
-
-        self.register_buffer('weight_cons', cos_basis.transpose(0, 1).unsqueeze(1).float()) # [dim, 1, n_fft]
-        self.register_buffer('weight_sin', sin_basis.transpose(0, 1).unsqueeze(1).float())
-
-        # NOLA constant for Hann(16), hop=4 is 1.5.
-        # IFFT scaling is 1/16.
-        # Total divisor = 1.5 * 16 = 24.0.
-        self.register_buffer('divisor', torch.tensor(24.0))
-
-    def forward(self, magnitude, phase):
-        # magnitude, phase: [B, F, T]
-        real_spec = magnitude * torch.cos(phase)
-        imag_spec = magnitude * torch.sin(phase)
-
-        # IFFT Real part reconstruction:
-        # Signal = Sum_k ( Real[k]*Cos[nk] - Imag[k]*Sin[nk] )
-
-        y1 = F.conv_transpose1d(real_spec, self.weight_cons, stride=self.hop_length)
-        y2 = F.conv_transpose1d(imag_spec, self.weight_sin, stride=self.hop_length)
-
-        y = y1 - y2
-
-        # Remove center padding (n_fft // 2)
-        # torch.istft(center=True) removes the padding it added implicitly?
-        # No, center=True in stft/istft means the timestamps are centered.
-        # The output length is normally N * Hop.
-        # We just need to handle valid region.
-        # But since we are exporting the generator which usually crops output or matches input length...
-        # Let's check generator code:
-        # x = torch._istft(...)
-        # x = torch.clamp(x, ...)
-        # The generator does not crop explicitly inside decode?
-        # Ah, "x = x[:, :-int(...)]" in finalize=False.
-
-        # Standard istft(center=True) returns length L.
-        # ConvTranspose1d returns length (T-1)*stride + kernel_size.
-        # (T)*Hop + (N_FFT - Hop).
-        # We need to trim the n_fft//2 padding from both sides to match center=True.
-
-        pad = self.n_fft // 2
-        y = y[:, :, pad:-pad]
-
-        # Squeeze the channel dimension if necessary [B, 1, T] -> [B, T]
-        # But wait, generator output expects [B, 1, T] or [B, T]?
-        # Original torch.istft returns [B, T].
-        # ConvTranpose1d returns [B, C_out, T]. Here C_out=1.
-        # So we have [B, 1, T].
-
-        return (y / self.divisor).squeeze(1)
 
 
 """hifigan based generator implementation.
@@ -603,6 +587,141 @@ class HiFTGenerator(nn.Module):
         for l in self.source_resblocks:
             l.remove_weight_norm()
 
+    def _onnx_stft(self, x):
+        # x: [B, T]
+        # Manual STFT implementation using Conv1d + FFT to avoid ONNX STFT op dynamic rank issues.
+
+        if x.dim() == 3:
+            x = x.squeeze(1)
+
+        n_fft = self.istft_params["n_fft"]
+        hop_length = self.istft_params["hop_len"]
+
+        # 1. Pad signal (reflect)
+        # center=True behavior: pad n_fft // 2 on both sides
+        pad = n_fft // 2
+        x = x.unsqueeze(1) # [B, 1, T]
+        x = torch.nn.functional.pad(x, (pad, pad), mode='reflect')
+
+        # 2. Frame extraction using Conv1d
+        # We use a Conv1d to extract frames of size n_fft with stride hop_length.
+        # Input: [B, 1, T_padded]
+        # Weight: Identity matrix viewed as [n_fft, 1, n_fft].
+        # This maps each position in the window to an output channel.
+        # frame[b, k, t] = x[b, 0, t*stride + k]
+        eye = torch.eye(n_fft, device=x.device, dtype=x.dtype)
+        weights = eye.view(n_fft, 1, n_fft)
+
+        # [B, n_fft, n_frames]
+        frames = torch.nn.functional.conv1d(x, weights, stride=hop_length)
+
+        # 3. Apply Window
+        # window shape [n_fft] -> [1, n_fft, 1]
+        w = self.stft_window.to(x.device).view(1, n_fft, 1)
+        frames = frames * w
+
+        # 4. FFT
+        # Perform FFT using Matrix Multiplication to ensure ONNX compatibility and shape correctness.
+        # This avoids using the atomic DFT op which can have shape inference issues.
+
+        n_freqs = n_fft // 2 + 1
+
+        # specific implementation of rfft using matmul
+        # W[k, n] = exp(-2j * pi * k * n / N)
+        # Real part: cos(...), Imag part: sin(...)
+
+        # Create DFT matrix on the fly (or cache it)
+        # We rely on ONNX constant folding for the meshgrid/cos/sin parts.
+
+        k = torch.arange(n_freqs, device=x.device).unsqueeze(1) # [F, 1]
+        n = torch.arange(n_fft, device=x.device).unsqueeze(0)   # [1, N]
+        theta = -2 * np.pi * k * n / n_fft
+
+        mat_real = torch.cos(theta).to(dtype=x.dtype) # [F, N]
+        mat_imag = torch.sin(theta).to(dtype=x.dtype) # [F, N]
+
+        # frames: [B, N, T]
+        # output: [B, F, T]
+        spec_real = torch.matmul(mat_real, frames)
+        spec_imag = torch.matmul(mat_imag, frames)
+
+        # Return Real and Imag parts [B, F, T]
+        return spec_real, spec_imag
+
+    def _onnx_istft(self, magnitude, phase):
+        magnitude = torch.clip(magnitude, max=1e2)
+        real = magnitude * torch.cos(phase)
+        img = magnitude * torch.sin(phase)
+
+        # Manual decomposition of ISTFT to ensure clean ONNX export:
+        # Replaced with Manual IDFT using MatMul
+
+        n_fft = self.istft_params["n_fft"]
+        hop_length = self.istft_params["hop_len"]
+        device = magnitude.device
+
+        # 2. Inverse FFT
+        # x[n] = 1/N * sum(X[k] * exp(j*2*pi*k*n/N))
+
+        n_freqs = n_fft // 2 + 1
+        k = torch.arange(n_freqs, device=device).unsqueeze(1) # [F, 1]
+        n = torch.arange(n_fft, device=device).unsqueeze(0)   # [1, N]
+        theta = 2 * np.pi * k * n / n_fft
+
+        # Scaling
+        scale = torch.ones(n_freqs, 1, device=device) / n_fft
+        if n_fft % 2 == 0:
+            scale[1:-1] *= 2
+        else:
+            scale[1:] *= 2
+
+        # IDFT Matrix [N, F]
+        # Transpose theta to [N, F]
+        mat_real = (torch.cos(theta).T * scale.T).to(dtype=magnitude.dtype)
+        mat_imag = (torch.sin(theta).T * scale.T).to(dtype=magnitude.dtype)
+
+        # MatMul: (N, F) @ (B, F, T) -> (B, N, T)
+        x_real = torch.matmul(mat_real, real)
+        x_imag = torch.matmul(mat_imag, img)
+        x = x_real - x_imag
+
+
+        # 3. Apply Window
+        window = self.stft_window.to(device)
+
+        window = window.view(1, n_fft, 1)
+        x = x * window
+
+        # 4. Overlap-Add (Signal) using ConvTranspose1d
+        # We view the frames as independent channels that need to be summed at offsets.
+        # Weight [In, Out, K] = [n_fft, 1, n_fft]. Identity matrix.
+        # This maps each sample in the frame to its correct position in the output window.
+        ola_weights = torch.eye(n_fft, device=device).view(n_fft, 1, n_fft)
+
+        # stride=hop_length places the next frame at +hop_length
+        signal = F.conv_transpose1d(x, ola_weights, stride=hop_length, padding=0)
+
+        # 5. Overlap-Add (Envelope) for NOLA normalization
+        # We need to divide by the sum of squared windows.
+        window_sq = window.pow(2)
+        # Create a "ones" signal with the window shape to sum up window weights
+        # Expanding window_sq to [B, n_fft, T] efficiently
+        batch_size, _, n_frames = x.shape
+        window_sq_frames = window_sq.expand(batch_size, -1, n_frames)
+
+        envelope = F.conv_transpose1d(window_sq_frames, ola_weights, stride=hop_length, padding=0)
+
+        # 6. Normalize
+        signal = signal / (envelope + 1e-11)
+
+        # 7. Trim padding (center=True behavior)
+        # center=True pads n_fft // 2 at both ends during STFT.
+        # We must remove this padding.
+        pad_amt = n_fft // 2
+        signal = signal[:, :, pad_amt:-pad_amt]
+
+        return signal.squeeze(1)
+
     def _stft(self, x):
         spec = torch.stft(
             x,
@@ -867,35 +986,10 @@ class CausalHiFTGenerator(HiFTGenerator):
         """
         self = self.to(device)
         self.eval()
-        try:
-            self.remove_weight_norm()
-        except Exception:
-            pass
 
-        # --- Patch STFT/ISTFT with Conv implementations to avoid ONNX export crash / custom op issues ---
-        print("Patching STFT/ISTFT with compatible Conv implementations...")
-        stft_module = STFT_Conv(
-            self.istft_params["n_fft"],
-            self.istft_params["hop_len"],
-            self.stft_window.to(device)
-        ).to(device)
-
-        istft_module = ISTFT_Conv(
-            self.istft_params["n_fft"],
-            self.istft_params["hop_len"],
-            self.stft_window.to(device)
-        ).to(device)
-
-        def patched_stft(self_gen, x):
-            return stft_module(x)
-
-        def patched_istft(self_gen, magnitude, phase):
-            return istft_module(magnitude, phase)
-
-        # Bind methods to the instance
-        self._stft = types.MethodType(patched_stft, self)
-        self._istft = types.MethodType(patched_istft, self)
-        # -----------------------------------------------------------------------------------------------
+        ## reset _stft and _istft with ONNX compatible versions
+        self._stft = self._onnx_stft
+        self._istft = self._onnx_istft
 
         # Create a wrapper that fixes the finalize parameter and implements forward logic
         class ONNXWrapper(torch.nn.Module):
@@ -918,17 +1012,17 @@ class CausalHiFTGenerator(HiFTGenerator):
             (speech_feat, s),
             onnx_model_path,
             export_params=True,
-            opset_version=10, # User specified 10 to avoid core dump
+            opset_version=17,
             do_constant_folding=True,
             verbose=False,
-            #operator_export_type=torch.onnx.OperatorExportTypes.ONNX_ATEN_FALLBACK,
             input_names=['speech_feat', 'cache_source'],
             output_names=['waveform'],
             dynamic_axes={
-                'speech_feat': {0: 'batch', 2: 'time'},
-                'cache_source': {0: 'batch', 2: 'time'},
-                'waveform': {1: 'time'},
+                'speech_feat': {0: 'batch', 2: 'time_feat'},
+                'cache_source': {0: 'batch', 2: 'time_source'},
+                'waveform': {1: 'time_source'},
             },
+            dynamo=False,
         )
         print("Export complete.")
 
